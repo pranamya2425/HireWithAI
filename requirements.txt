@@ -1,11 +1,10 @@
 # HireWithAI - Smart Resume Screening System
-# Requirements file for all necessary dependencies
 
 # Core Streamlit framework
-streamlit==1.28.2
+streamlit==1.49.0
 
 # CrewAI and GROQ API
-crewai==0.40.0
+crewai==0.140.0
 groq==0.4.2
 
 # NLP and text processing
@@ -31,7 +30,7 @@ python-dotenv==1.0.0
 pathlib2==2.3.7.post1
 typing-extensions==4.8.0
 
-# Optional: For enhanced NLP features
+# Optional: Enhanced NLP features
 nltk==3.8.1
 scikit-learn==1.3.2
 
