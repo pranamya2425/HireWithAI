@@ -19,6 +19,9 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Any
 import warnings
+import time
+import asyncio
+from datetime import datetime, timedelta
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -33,18 +36,19 @@ try:
     import PyPDF2
     import docx2txt
     import re
-    from datetime import datetime
     import hashlib
 except ImportError as e:
     st.error(f"Missing required dependency: {e}")
     st.stop()
 
-# Configuration
-GROQ_MODELS = {
-    "llama-3.1-70b-versatile": "Llama 3.1 70B (Recommended)",
-    "llama-3.1-8b-instant": "Llama 3.1 8B (Fastest)",
-    "mixtral-8x7b-32768": "Mixtral 8x7B"
-}
+# Configuration - Single model only
+GROQ_MODEL = "llama-3.1-8b-instant"
+MODEL_DISPLAY_NAME = "Llama 3.1 8B (Fastest)"
+
+# Rate limiting configuration
+RATE_LIMIT_DELAY = 3  # seconds between requests
+MAX_RETRIES = 3
+BATCH_SIZE = 2  # Process resumes in smaller batches
 
 # Initialize session state
 if 'processed_resumes' not in st.session_state:
@@ -53,6 +57,25 @@ if 'ranked_candidates' not in st.session_state:
     st.session_state.ranked_candidates = []
 if 'job_description' not in st.session_state:
     st.session_state.job_description = ""
+
+class RateLimitHandler:
+    """Handle rate limiting for API calls"""
+    
+    def __init__(self, delay=RATE_LIMIT_DELAY):
+        self.delay = delay
+        self.last_request_time = 0
+    
+    def wait_if_needed(self):
+        """Wait if necessary to respect rate limits"""
+        current_time = time.time()
+        time_since_last_request = current_time - self.last_request_time
+        
+        if time_since_last_request < self.delay:
+            sleep_time = self.delay - time_since_last_request
+            st.info(f"⏳ Rate limit protection: waiting {sleep_time:.1f}s...")
+            time.sleep(sleep_time)
+        
+        self.last_request_time = time.time()
 
 class ResumeProcessor:
     """Utility class for processing resume files"""
@@ -74,12 +97,11 @@ class ResumeProcessor:
     def extract_text_from_docx(file_buffer) -> str:
         """Extract text from DOCX file"""
         try:
-            # Save uploaded file to temp location
             with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
                 tmp_file.write(file_buffer.read())
                 tmp_file.flush()
                 text = docx2txt.process(tmp_file.name)
-                os.unlink(tmp_file.name)  # Clean up temp file
+                os.unlink(tmp_file.name)
                 return text.strip()
         except Exception as e:
             st.error(f"Error reading DOCX: {e}")
@@ -95,15 +117,17 @@ class ResumeProcessor:
             return ""
 
 class HireWithAICrew:
-    """Main CrewAI multi-agent system for resume screening"""
+    """Main CrewAI multi-agent system for resume screening with rate limiting"""
     
-    def __init__(self, groq_api_key: str, model: str = "llama-3.1-70b-versatile"):
-        """Initialize the crew with GROQ API"""
+    def __init__(self, groq_api_key: str):
+        """Initialize the crew with GROQ API and rate limiting"""
         self.llm = LLM(
-            model=f"groq/{model}",
+            model=f"groq/{GROQ_MODEL}",
             api_key=groq_api_key,
             temperature=0.1
         )
+        
+        self.rate_limiter = RateLimitHandler()
         
         # Initialize spaCy for NLP operations
         try:
@@ -116,11 +140,10 @@ class HireWithAICrew:
         """Create the Resume Parser Agent"""
         return Agent(
             role='Resume Parser Specialist',
-            goal='Extract structured candidate information from resume text with high accuracy',
-            backstory="""You are an expert resume parser with years of experience in 
-            extracting structured data from various resume formats. You excel at identifying 
-            personal information, work experience, education, skills, and other relevant 
-            candidate details from unstructured text.""",
+            goal='Extract key candidate information from resume text efficiently',
+            backstory="""You are an expert resume parser focused on extracting essential 
+            candidate information quickly and accurately. You prioritize the most important 
+            details: name, contact info, skills, experience, and education.""",
             llm=self.llm,
             verbose=True,
             allow_delegation=False
@@ -130,11 +153,10 @@ class HireWithAICrew:
         """Create the Skill Matcher Agent"""
         return Agent(
             role='Skill Matching Expert',
-            goal='Match candidate skills with job requirements using advanced NLP techniques',
-            backstory="""You are a skilled NLP expert specializing in semantic skill matching. 
-            You can identify both explicit and implicit skill matches, understand skill 
-            synonyms, and evaluate skill relevance levels. You're excellent at finding 
-            transferable skills and assessing skill proficiency levels.""",
+            goal='Efficiently match candidate skills with job requirements',
+            backstory="""You are a skilled matcher who quickly identifies relevant skills 
+            and calculates match percentages. You focus on the most critical skills 
+            and provide concise, actionable insights.""",
             llm=self.llm,
             verbose=True,
             allow_delegation=False
@@ -144,163 +166,189 @@ class HireWithAICrew:
         """Create the Ranking Agent"""
         return Agent(
             role='Candidate Ranking Analyst',
-            goal='Rank candidates based on job fit, experience, and overall suitability',
-            backstory="""You are a senior recruitment analyst with expertise in candidate 
-            evaluation and ranking. You excel at weighing multiple factors like skills match, 
-            experience level, education relevance, and career progression to create accurate 
-            candidate rankings for specific roles.""",
+            goal='Rank candidates efficiently based on key criteria',
+            backstory="""You are a recruitment analyst who creates fast, accurate candidate 
+            rankings. You focus on the most important factors: skills match, experience 
+            relevance, and overall job fit.""",
             llm=self.llm,
             verbose=True,
             allow_delegation=False
         )
     
-    def create_resume_parsing_task(self, resume_text: str, filename: str) -> Task:
-        """Create task for parsing resume"""
+    def create_concise_parsing_task(self, resume_text: str, filename: str) -> Task:
+        """Create a more concise parsing task to reduce token usage"""
+        # Truncate resume text if too long to save tokens
+        max_chars = 2000
+        truncated_text = resume_text[:max_chars] + "..." if len(resume_text) > max_chars else resume_text
+        
         return Task(
             description=f"""
-            Parse the following resume text and extract structured information:
+            Extract key information from this resume in JSON format:
             
-            Resume Text:
-            {resume_text}
+            Resume: {filename}
+            Text: {truncated_text}
             
-            Extract the following information in JSON format:
-            1. Personal Information (name, email, phone, location)
-            2. Professional Summary/Objective
-            3. Work Experience (company, position, duration, responsibilities)
-            4. Education (degree, institution, graduation year)
-            5. Skills (technical and soft skills)
-            6. Certifications
-            7. Projects (if mentioned)
-            8. Total years of experience
+            Extract:
+            1. Name and contact (email, phone)
+            2. Key skills (top 5-8 most relevant)
+            3. Experience summary (years, key roles)
+            4. Education (degree, field)
+            5. Notable achievements
             
-            Filename: {filename}
-            
-            Ensure the output is valid JSON format with all relevant fields.
+            Keep response concise and structured.
             """,
-            expected_output="Structured JSON containing all extracted resume information",
+            expected_output="Concise JSON with essential candidate information",
             agent=self.create_resume_parser_agent()
         )
     
-    def create_skill_matching_task(self, resume_data: str, job_description: str) -> Task:
-        """Create task for matching skills"""
+    def create_concise_skill_matching_task(self, resume_data: str, job_description: str) -> Task:
+        """Create a more concise skill matching task"""
+        # Truncate job description if too long
+        max_jd_chars = 1000
+        truncated_jd = job_description[:max_jd_chars] + "..." if len(job_description) > max_jd_chars else job_description
+        
         return Task(
             description=f"""
-            Analyze the following candidate data against the job description and provide skill matching analysis:
+            Analyze skill match between candidate and job:
             
-            Candidate Data:
-            {resume_data}
+            Job Requirements: {truncated_jd}
+            Candidate Data: {resume_data}
             
-            Job Description:
-            {job_description}
+            Provide:
+            1. Match percentage (0-100%)
+            2. Top 5 matching skills
+            3. Top 3 missing critical skills
+            4. Experience level fit (1-10)
             
-            Perform the following analysis:
-            1. Identify required skills from job description
-            2. Extract candidate skills from resume data
-            3. Calculate skill match percentage
-            4. Identify missing critical skills
-            5. Find transferable/related skills
-            6. Assess experience level match
-            7. Provide skill gap analysis
-            
-            Return results in JSON format with match scores and detailed analysis.
+            Keep analysis concise and focused.
             """,
-            expected_output="Comprehensive skill matching analysis in JSON format",
+            expected_output="Concise skill matching analysis in JSON format",
             agent=self.create_skill_matcher_agent()
         )
     
-    def create_ranking_task(self, candidates_analysis: List[str], job_description: str) -> Task:
-        """Create task for ranking candidates"""
-        return Task(
-            description=f"""
-            Rank the following candidates based on their suitability for the job:
-            
-            Job Description:
-            {job_description}
-            
-            Candidates Analysis:
-            {json.dumps(candidates_analysis, indent=2)}
-            
-            Ranking Criteria:
-            1. Skills match percentage (40% weight)
-            2. Years of relevant experience (25% weight)
-            3. Education relevance (15% weight)
-            4. Career progression (10% weight)
-            5. Cultural fit indicators (10% weight)
-            
-            Provide:
-            1. Overall ranking with scores
-            2. Detailed justification for each candidate
-            3. Top 3 recommendations with reasoning
-            4. Interview recommendations for top candidates
-            
-            Return results in JSON format with rankings and explanations.
-            """,
-            expected_output="Comprehensive candidate ranking with detailed analysis in JSON format",
-            agent=self.create_ranking_agent()
-        )
+    def safe_crew_execution(self, crew, max_retries=MAX_RETRIES):
+        """Execute crew with retry logic for rate limits"""
+        for attempt in range(max_retries):
+            try:
+                self.rate_limiter.wait_if_needed()
+                result = crew.kickoff()
+                return result
+            except Exception as e:
+                error_str = str(e).lower()
+                if "rate limit" in error_str or "ratelimit" in error_str:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5  # Progressive backoff
+                        st.warning(f"Rate limit hit. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        st.error("Maximum retries reached. Please try again later or upgrade your Groq plan.")
+                        return None
+                else:
+                    st.error(f"Error during processing: {e}")
+                    return None
+        return None
     
-    def process_resumes(self, resumes_data: List[Dict], job_description: str) -> Dict:
-        """Process multiple resumes through the crew"""
+    def process_resumes_with_batching(self, resumes_data: List[Dict], job_description: str) -> Dict:
+        """Process resumes in smaller batches to avoid rate limits"""
         try:
-            # Step 1: Parse all resumes
-            parsed_resumes = []
+            all_parsed_resumes = []
+            all_skill_analysis = []
             
-            for resume_data in resumes_data:
-                parsing_task = self.create_resume_parsing_task(
-                    resume_data['text'], 
-                    resume_data['filename']
+            # Process resumes in batches
+            total_resumes = len(resumes_data)
+            batches = [resumes_data[i:i + BATCH_SIZE] for i in range(0, total_resumes, BATCH_SIZE)]
+            
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+            
+            for batch_idx, batch in enumerate(batches):
+                progress_text.text(f"Processing batch {batch_idx + 1} of {len(batches)}...")
+                
+                # Step 1: Parse resumes in current batch
+                for resume_idx, resume_data in enumerate(batch):
+                    overall_progress = (batch_idx * BATCH_SIZE + resume_idx) / total_resumes
+                    progress_bar.progress(overall_progress)
+                    
+                    parsing_task = self.create_concise_parsing_task(
+                        resume_data['text'], 
+                        resume_data['filename']
+                    )
+                    
+                    parsing_crew = Crew(
+                        agents=[self.create_resume_parser_agent()],
+                        tasks=[parsing_task],
+                        verbose=False  # Reduce verbosity to save tokens
+                    )
+                    
+                    result = self.safe_crew_execution(parsing_crew)
+                    if result:
+                        all_parsed_resumes.append({
+                            'filename': resume_data['filename'],
+                            'parsed_data': result.raw,
+                            'original_text': resume_data['text'][:500]  # Store only first 500 chars
+                        })
+                
+                # Step 2: Skill matching for current batch
+                for resume in all_parsed_resumes[-len(batch):]:  # Only process newly added resumes
+                    skill_task = self.create_concise_skill_matching_task(
+                        resume['parsed_data'],
+                        job_description
+                    )
+                    
+                    skill_crew = Crew(
+                        agents=[self.create_skill_matcher_agent()],
+                        tasks=[skill_task],
+                        verbose=False
+                    )
+                    
+                    result = self.safe_crew_execution(skill_crew)
+                    if result:
+                        all_skill_analysis.append({
+                            'filename': resume['filename'],
+                            'skill_analysis': result.raw,
+                            'parsed_data': resume['parsed_data']
+                        })
+            
+            progress_bar.progress(1.0)
+            progress_text.text("Finalizing rankings...")
+            
+            # Step 3: Final ranking (only if we have successful analyses)
+            if all_skill_analysis:
+                # Create a more concise ranking task
+                ranking_task = Task(
+                    description=f"""
+                    Rank these candidates for the job. Provide top 5 ranked candidates with scores.
+                    
+                    Job: {job_description[:500]}...
+                    
+                    Candidates: {json.dumps([sa['skill_analysis'] for sa in all_skill_analysis[:5]], indent=1)}
+                    
+                    Provide concise ranking with:
+                    1. Candidate name and rank
+                    2. Overall score (0-100)
+                    3. Key strengths (2-3 points)
+                    4. Brief recommendation
+                    """,
+                    expected_output="Concise candidate ranking with top recommendations",
+                    agent=self.create_ranking_agent()
                 )
                 
-                parsing_crew = Crew(
-                    agents=[self.create_resume_parser_agent()],
-                    tasks=[parsing_task],
-                    verbose=True
+                ranking_crew = Crew(
+                    agents=[self.create_ranking_agent()],
+                    tasks=[ranking_task],
+                    verbose=False
                 )
                 
-                result = parsing_crew.kickoff()
-                parsed_resumes.append({
-                    'filename': resume_data['filename'],
-                    'parsed_data': result.raw,
-                    'original_text': resume_data['text']
-                })
-            
-            # Step 2: Match skills for each candidate
-            skill_analysis = []
-            
-            for resume in parsed_resumes:
-                skill_task = self.create_skill_matching_task(
-                    resume['parsed_data'],
-                    job_description
-                )
-                
-                skill_crew = Crew(
-                    agents=[self.create_skill_matcher_agent()],
-                    tasks=[skill_task],
-                    verbose=True
-                )
-                
-                result = skill_crew.kickoff()
-                skill_analysis.append({
-                    'filename': resume['filename'],
-                    'skill_analysis': result.raw,
-                    'parsed_data': resume['parsed_data']
-                })
-            
-            # Step 3: Rank all candidates
-            ranking_task = self.create_ranking_task(skill_analysis, job_description)
-            
-            ranking_crew = Crew(
-                agents=[self.create_ranking_agent()],
-                tasks=[ranking_task],
-                verbose=True
-            )
-            
-            ranking_result = ranking_crew.kickoff()
+                ranking_result = self.safe_crew_execution(ranking_crew)
+                final_ranking = ranking_result.raw if ranking_result else "Ranking failed due to rate limits"
+            else:
+                final_ranking = "No candidates could be analyzed due to rate limits"
             
             return {
-                'parsed_resumes': parsed_resumes,
-                'skill_analysis': skill_analysis,
-                'final_ranking': ranking_result.raw
+                'parsed_resumes': all_parsed_resumes,
+                'skill_analysis': all_skill_analysis,
+                'final_ranking': final_ranking
             }
             
         except Exception as e:
@@ -329,18 +377,12 @@ def main():
         border-radius: 10px;
         margin-bottom: 2rem;
     }
-    .metric-card {
-        background: #f8f9fa;
-        padding: 1rem;
+    .rate-limit-info {
+        background: #fff3cd;
+        border: 1px solid #ffeaa7;
         border-radius: 8px;
-        border-left: 4px solid #667eea;
-    }
-    .success-message {
-        background: #d4edda;
-        color: #155724;
         padding: 1rem;
-        border-radius: 8px;
-        border: 1px solid #c3e6cb;
+        margin: 1rem 0;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -370,15 +412,22 @@ def main():
             st.info("💡 **Get Free GROQ API Key:**\n1. Visit https://console.groq.com/\n2. Create an account\n3. Generate API key\n4. Paste it above")
             return
         
-        # Model selection
-        selected_model = st.selectbox(
-            "Select GROQ Model",
-            options=list(GROQ_MODELS.keys()),
-            format_func=lambda x: GROQ_MODELS[x],
-            index=0
-        )
+        # Model info (fixed model)
+        st.markdown("### 🤖 AI Model")
+        st.info(f"**Using:** {MODEL_DISPLAY_NAME}")
+        st.caption("Optimized for speed and efficiency")
         
-        st.info(f"**Using:** {GROQ_MODELS[selected_model]}")
+        # Rate limiting info
+        st.markdown("### ⚡ Rate Limiting")
+        st.markdown("""
+        <div class="rate-limit-info">
+            <strong>🛡️ Built-in Protection:</strong><br>
+            • Smart batch processing<br>
+            • Automatic retry logic<br>
+            • Progressive delays<br>
+            • Token usage optimization
+        </div>
+        """, unsafe_allow_html=True)
         
         # Processing statistics
         st.header("📊 Statistics")
@@ -386,7 +435,7 @@ def main():
         with col1:
             st.metric("Resumes Processed", len(st.session_state.processed_resumes))
         with col2:
-            st.metric("Candidates Ranked", len(st.session_state.ranked_candidates))
+            st.metric("Candidates Ranked", len(st.session_state.ranked_candidates) if st.session_state.ranked_candidates else 0)
     
     # Main content tabs
     tab1, tab2, tab3 = st.tabs(["📝 Job Description", "📄 Upload Resumes", "🏆 Results"])
@@ -424,16 +473,30 @@ We are looking for a Senior Python Developer with experience in:
             st.warning("⚠️ Please add a job description first in the 'Job Description' tab")
             return
         
+        # Rate limiting advice
+        st.markdown("""
+        <div class="rate-limit-info">
+            <strong>💡 Tips for Best Results:</strong><br>
+            • Upload 2-5 resumes at a time for optimal processing<br>
+            • Larger batches will be automatically split and processed with delays<br>
+            • The system includes built-in rate limit protection<br>
+        </div>
+        """, unsafe_allow_html=True)
+        
         # File uploader
         uploaded_files = st.file_uploader(
             "Choose resume files",
             type=['pdf', 'docx', 'txt'],
             accept_multiple_files=True,
-            help="Supported formats: PDF, DOCX, TXT"
+            help="Supported formats: PDF, DOCX, TXT. Recommended: 2-5 files per batch"
         )
         
         if uploaded_files:
-            st.write(f"📁 **{len(uploaded_files)} files uploaded**")
+            file_count = len(uploaded_files)
+            st.write(f"📁 **{file_count} files uploaded**")
+            
+            if file_count > 5:
+                st.info(f"ℹ️ You've uploaded {file_count} files. They will be processed in batches of {BATCH_SIZE} with automatic delays to respect rate limits.")
             
             # Display uploaded files
             for file in uploaded_files:
@@ -445,19 +508,16 @@ We are looking for a Senior Python Developer with experience in:
                 st.error("Please provide GROQ API key")
                 return
                 
-            with st.spinner("🔄 Processing resumes... This may take a few minutes..."):
+            with st.spinner("🔄 Processing resumes with rate limit protection... This may take a few minutes..."):
                 try:
                     # Initialize the crew
-                    crew = HireWithAICrew(groq_api_key, selected_model)
+                    crew = HireWithAICrew(groq_api_key)
                     
                     # Extract text from uploaded files
                     resumes_data = []
                     processor = ResumeProcessor()
                     
-                    progress_bar = st.progress(0)
-                    total_files = len(uploaded_files)
-                    
-                    for i, uploaded_file in enumerate(uploaded_files):
+                    for uploaded_file in uploaded_files:
                         file_extension = uploaded_file.name.split('.')[-1].lower()
                         
                         # Reset file pointer
@@ -478,16 +538,14 @@ We are looking for a Senior Python Developer with experience in:
                                 'filename': uploaded_file.name,
                                 'text': text
                             })
-                        
-                        progress_bar.progress((i + 1) / total_files)
                     
                     if not resumes_data:
                         st.error("No valid resumes could be processed")
                         return
                     
-                    # Process through AI agents
-                    st.info("🤖 Running AI agents for resume analysis...")
-                    results = crew.process_resumes(resumes_data, st.session_state.job_description)
+                    # Process through AI agents with batching
+                    st.info("🤖 Running AI agents with intelligent batching and rate limiting...")
+                    results = crew.process_resumes_with_batching(resumes_data, st.session_state.job_description)
                     
                     if results:
                         st.session_state.processed_resumes = results.get('parsed_resumes', [])
@@ -496,7 +554,7 @@ We are looking for a Senior Python Developer with experience in:
                         st.success("✅ Resume processing completed successfully!")
                         st.info("📋 Check the 'Results' tab to view the analysis")
                     else:
-                        st.error("Failed to process resumes")
+                        st.error("Failed to process resumes due to rate limits or API issues")
                 
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
@@ -516,7 +574,6 @@ We are looking for a Senior Python Developer with experience in:
             st.subheader("📊 Candidate Rankings")
             
             if st.session_state.ranked_candidates:
-                # Display ranking results
                 st.markdown("### 🥇 Final Rankings")
                 st.text_area(
                     "Ranking Results",
@@ -530,7 +587,8 @@ We are looking for a Senior Python Developer with experience in:
                         'job_description': st.session_state.job_description,
                         'processed_resumes': st.session_state.processed_resumes,
                         'final_ranking': st.session_state.ranked_candidates,
-                        'timestamp': datetime.now().isoformat()
+                        'timestamp': datetime.now().isoformat(),
+                        'model_used': MODEL_DISPLAY_NAME
                     }
                     
                     st.download_button(
@@ -543,11 +601,9 @@ We are looking for a Senior Python Developer with experience in:
         with col2:
             st.subheader("📈 Summary")
             
-            # Display summary metrics
             if st.session_state.processed_resumes:
                 st.metric("Total Candidates", len(st.session_state.processed_resumes))
                 
-                # Create summary DataFrame
                 summary_data = []
                 for resume in st.session_state.processed_resumes:
                     summary_data.append({
@@ -574,15 +630,12 @@ We are looking for a Senior Python Developer with experience in:
     
     # Footer
     st.markdown("---")
-    st.markdown("""
+    st.markdown(f"""
     <div style='text-align: center; color: #666; margin-top: 2rem;'>
         <p>🤖 <b>HireWithAI</b> - Powered by CrewAI & GROQ API</p>
-        <p><i>Intelligent Multi-Agent Resume Screening System</i></p>
+        <p><i>Using {MODEL_DISPLAY_NAME} with Rate Limit Protection</i></p>
     </div>
     """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
-
-
-
