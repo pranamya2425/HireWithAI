@@ -3,43 +3,37 @@ name: Deploy to Hugging Face Spaces
 on:
   push:
     branches:
-      - main  # Change if you use master
+      - main
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout GitHub repo
-      - name: Checkout Repository
+      - name: Checkout Repo
         uses: actions/checkout@v3
 
-      # 2. Configure git user
       - name: Configure Git
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
-      # 3. Clone Hugging Face Space
       - name: Clone Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           git clone https://Jayanthk2004:$HF_TOKEN@huggingface.co/spaces/Jayanthk2004/HireWithAi space_repo
 
-      # 4. Copy all repo files to Space (avoid nested space_repo)
       - name: Copy Files
         run: |
           rsync -av --exclude='.git' ./ space_repo/
 
-      # 5. Install dependencies (optional: test build)
-      - name: Install Dependencies
+      - name: Install Dependencies (optional)
         run: |
           pip install --upgrade pip
           pip install -r space_repo/requirements.txt
 
-      # 6. Commit and push changes to Hugging Face Space
-      - name: Push to Hugging Face Space
+      - name: Commit & Push to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
